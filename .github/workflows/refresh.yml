@@ -1,0 +1,84 @@
+name: Refresh dashboard
+
+on:
+  schedule:
+    # 22:23 UTC Sun-Thu = 9:23 am Melbourne Mon-Fri in daylight time (8:23 am in winter).
+    # GitHub can start scheduled runs up to ~30 min late at busy times.
+    - cron: "23 22 * * 0-4"
+  workflow_dispatch: {}          # "Run workflow" button on the Actions tab
+  push:
+    branches: [main]
+    paths: ["rebuild.py", "requirements.txt", ".github/workflows/refresh.yml"]
+
+permissions:
+  contents: write                # commit the refreshed page back to the repo
+  pages: write                   # publish to GitHub Pages
+  id-token: write                # required by actions/deploy-pages
+
+concurrency:
+  group: refresh-dashboard
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Last good raw downloads from the previous run. If a source is down today,
+      # rebuild.py falls back to these and flags it on the page.
+      - name: Restore last good downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: raw
+          key: raw-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: raw-
+
+      - name: Rebuild dashboard
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}   # optional; blank if the secret is not set
+        run: python rebuild.py
+
+      - name: Save downloads for the next run
+        uses: actions/cache/save@v4
+        with:
+          path: raw
+          key: raw-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Commit refreshed page
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html signal.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Refresh dashboard $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Stage site
+        run: mkdir -p _site && cp index.html signal.csv _site/
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
